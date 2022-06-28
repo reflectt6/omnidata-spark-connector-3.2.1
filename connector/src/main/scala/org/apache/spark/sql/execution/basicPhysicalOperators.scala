@@ -212,7 +212,7 @@ trait GeneratePredicateHelper extends PredicateHelper {
 }
 
 /** Physical plan for Filter. */
-case class FilterExec(condition: Expression, child: SparkPlan)
+case class FilterExec(condition: Expression, child: SparkPlan, selectivity: Option[Double] = None)
   extends UnaryExecNode with CodegenSupport with GeneratePredicateHelper {
 
   // Split out all the IsNotNulls from condition.

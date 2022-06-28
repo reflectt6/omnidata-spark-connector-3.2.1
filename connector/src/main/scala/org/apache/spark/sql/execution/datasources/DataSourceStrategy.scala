@@ -20,9 +20,7 @@ package org.apache.spark.sql.execution.datasources
 import java.util.Locale
 
 import scala.collection.mutable
-
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
@@ -35,7 +33,8 @@ import org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.planning.ScanOperation
-import org.apache.spark.sql.catalyst.plans.logical.{InsertIntoDir, InsertIntoStatement, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.FilterEstimation
+import org.apache.spark.sql.catalyst.plans.logical.{Filter => LFilter, InsertIntoDir, InsertIntoStatement, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.connector.catalog.SupportsRead
@@ -413,7 +412,10 @@ object DataSourceStrategy
         scanBuilder(requestedColumns, candidatePredicates, pushedFilters),
         relation.relation,
         relation.catalogTable.map(_.identifier))
-      filterCondition.map(execution.FilterExec(_, scan)).getOrElse(scan)
+      filterCondition.map{ x =>
+        val selectivity = FilterEstimation(LFilter(x, relation)).calculateFilterSelectivity(x)
+        execution.FilterExec(x, scan, selectivity)
+      }.getOrElse(scan)
     } else {
       // A set of column attributes that are only referenced by pushed down filters.  We can
       // eliminate them from requested columns.
@@ -437,7 +439,10 @@ object DataSourceStrategy
         relation.relation,
         relation.catalogTable.map(_.identifier))
       execution.ProjectExec(
-        projects, filterCondition.map(execution.FilterExec(_, scan)).getOrElse(scan))
+        projects, filterCondition.map{x =>
+          val selectivity = FilterEstimation(LFilter(x, relation)).calculateFilterSelectivity(x)
+          execution.FilterExec(x, scan, selectivity)
+        }.getOrElse(scan))
     }
   }
 

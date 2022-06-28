@@ -20,10 +20,8 @@ package org.apache.spark.sql.execution
 import java.util.concurrent.TimeUnit._
 
 import scala.collection.mutable.HashMap
-
 import org.apache.commons.lang3.StringUtils
 import org.apache.hadoop.fs.Path
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.{InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
@@ -35,6 +33,7 @@ import org.apache.spark.sql.connector.expressions.aggregate.Aggregation
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat => ParquetSource}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.sql.execution.ndp.NdpSupport
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.{BaseRelation, Filter}
 import org.apache.spark.sql.types.StructType
@@ -187,8 +186,9 @@ case class FileSourceScanExec(
     optionalNumCoalescedBuckets: Option[Int],
     dataFilters: Seq[Expression],
     tableIdentifier: Option[TableIdentifier],
+    partiTionColumn: Seq[Attribute],
     disableBucketedScan: Boolean = false)
-  extends DataSourceScanExec {
+  extends DataSourceScanExec with NdpSupport {
 
   // Note that some vals referring the file-based relation are lazy intentionally
   // so that this plan can be canonicalized on executor side too. See SPARK-23731.
@@ -206,8 +206,8 @@ case class FileSourceScanExec(
 
   override def vectorTypes: Option[Seq[String]] =
     relation.fileFormat.vectorTypes(
-      requiredSchema = requiredSchema,
-      partitionSchema = relation.partitionSchema,
+      requiredSchema = output.toStructType,
+      partitionSchema = new StructType(),
       relation.sparkSession.sessionState.conf)
 
   private lazy val driverMetrics: HashMap[String, Long] = HashMap.empty
@@ -259,6 +259,7 @@ case class FileSourceScanExec(
       setFilesNumAndSizeMetric(ret, false)
       val timeTakenMs = (System.nanoTime() - startTime) / 1000 / 1000
       driverMetrics("pruningTime") = timeTakenMs
+      driverMetrics("numPartitions") = ret.length
       ret
     } else {
       selectedPartitions
@@ -491,7 +492,7 @@ case class FileSourceScanExec(
 
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
-    if (needsUnsafeRowConversion) {
+    if (isPushDown || needsUnsafeRowConversion) {
       inputRDD.mapPartitionsWithIndexInternal { (index, iter) =>
         val toUnsafe = UnsafeProjection.create(schema)
         toUnsafe.initialize(index)
@@ -588,7 +589,12 @@ case class FileSourceScanExec(
       }
     }
 
-    new FileScanRDD(fsRelation.sparkSession, readFile, filePartitions)
+    if (isPushDown) {
+      new FileScanRDDPushDown(fsRelation.sparkSession, filePartitions, requiredSchema, output,
+        relation.dataSchema, ndpOperators, partiTionColumn, supportsColumnar, fsRelation.fileFormat)
+    } else {
+      new FileScanRDD(fsRelation.sparkSession, readFile, filePartitions)
+    }
   }
 
   /**
@@ -644,7 +650,12 @@ case class FileSourceScanExec(
     val partitions =
       FilePartition.getFilePartitions(relation.sparkSession, splitFiles, maxSplitBytes)
 
-    new FileScanRDD(fsRelation.sparkSession, readFile, partitions)
+    if (isPushDown) {
+      new FileScanRDDPushDown(fsRelation.sparkSession, partitions, requiredSchema, output,
+        relation.dataSchema, ndpOperators, partiTionColumn, supportsColumnar, fsRelation.fileFormat)
+    } else {
+      new FileScanRDD(fsRelation.sparkSession, readFile, partitions)
+    }
   }
 
   // Filters unused DynamicPruningExpression expressions - one which has been replaced
@@ -655,6 +666,14 @@ case class FileSourceScanExec(
   }
 
   override def doCanonicalize(): FileSourceScanExec = {
+    val ref = dataFilters.flatMap(_.references)
+    val exprIds = ref.map(x => (x.name, x.exprId)).toMap
+    val filterOutput = relation.dataSchema.fields.filter { x =>
+      ref.map(_.name).contains(x.name)
+    }.map { x =>
+      AttributeReference(x.name, x.dataType, x.nullable, x.metadata)(exprIds.getOrElse(x.name,
+        NamedExpression.newExprId))
+    }.toSeq
     FileSourceScanExec(
       relation,
       output.map(QueryPlan.normalizeExpressions(_, output)),
@@ -663,8 +682,9 @@ case class FileSourceScanExec(
         filterUnusedDynamicPruningExpressions(partitionFilters), output),
       optionalBucketSet,
       optionalNumCoalescedBuckets,
-      QueryPlan.normalizePredicates(dataFilters, output),
+      QueryPlan.normalizePredicates(dataFilters, filterOutput),
       None,
+      partiTionColumn.map(QueryPlan.normalizeExpressions(_, output)),
       disableBucketedScan)
   }
 }

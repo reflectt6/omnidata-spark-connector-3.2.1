@@ -21,19 +21,21 @@ import java.io.IOException
 import java.util.Locale
 
 import org.apache.hadoop.fs.{FileSystem, Path}
-
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning._
-import org.apache.spark.sql.catalyst.plans.logical.{InsertIntoDir, InsertIntoStatement, LogicalPlan, ScriptTransformation, Statistics}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.FilterEstimation
+import org.apache.spark.sql.catalyst.plans.logical.{Filter => LFilter, InsertIntoDir, InsertIntoStatement, LogicalPlan, ScriptTransformation, Statistics}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.command.{CreateTableCommand, DDLUtils}
 import org.apache.spark.sql.execution.datasources.{CreateTable, DataSourceStrategy}
+import org.apache.spark.sql.execution.ndp.NdpConf
+import org.apache.spark.sql.execution.ndp.NdpConf.NDP_ENABLED
 import org.apache.spark.sql.hive.execution._
 import org.apache.spark.sql.hive.execution.HiveScriptTransformationExec
-import org.apache.spark.sql.internal.HiveSerDe
+import org.apache.spark.sql.internal.{HiveSerDe, SQLConf}
 
 
 /**
@@ -191,37 +193,55 @@ object HiveAnalysis extends Rule[LogicalPlan] {
  */
 case class RelationConversions(
     sessionCatalog: HiveSessionCatalog) extends Rule[LogicalPlan] {
-  private def isConvertible(relation: HiveTableRelation): Boolean = {
-    isConvertible(relation.tableMeta)
+  private def isInsertConvertible(relation: HiveTableRelation, isPushDown : Boolean): Boolean = {
+    isInsertConvertible(relation.tableMeta, isPushDown)
   }
-
+  private def isRelationConvertible(relation: HiveTableRelation, isPushDown : Boolean): Boolean = {
+    isRelationConvertible(relation.tableMeta, isPushDown)
+  }
   private def isConvertible(tableMeta: CatalogTable): Boolean = {
     val serde = tableMeta.storage.serde.getOrElse("").toLowerCase(Locale.ROOT)
-    serde.contains("parquet") && conf.getConf(HiveUtils.CONVERT_METASTORE_PARQUET) ||
-      serde.contains("orc") && conf.getConf(HiveUtils.CONVERT_METASTORE_ORC)
+    serde.contains("parquet") && SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_PARQUET) ||
+      serde.contains("orc") && SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_ORC)
+  }
+
+  private def isRelationConvertible(tableMeta: CatalogTable, isPushDown : Boolean): Boolean = {
+    val serde = tableMeta.storage.serde.getOrElse("").toLowerCase(Locale.ROOT)
+    serde.contains("parquet") && (SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_PARQUET)
+      || isPushDown) || serde.contains("orc") &&
+      (SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_ORC) || isPushDown)
+  }
+
+  private def isInsertConvertible(tableMeta: CatalogTable, isPushDown : Boolean): Boolean = {
+    val serde = tableMeta.storage.serde.getOrElse("").toLowerCase(Locale.ROOT)
+    serde.contains("parquet") && (SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_PARQUET)
+      && !isPushDown) || serde.contains("orc") &&
+      (SQLConf.get.getConf(HiveUtils.CONVERT_METASTORE_ORC) && !isPushDown)
   }
 
   private val metastoreCatalog = sessionCatalog.metastoreCatalog
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
+    val isPushDown = NdpConf.toBoolean(NDP_ENABLED,
+      conf.getConfString("spark.sql.ndp.enabled", "true"), conf)
     plan resolveOperators {
       // Write path
       case InsertIntoStatement(
           r: HiveTableRelation, partition, cols, query, overwrite, ifPartitionNotExists)
           if query.resolved && DDLUtils.isHiveTable(r.tableMeta) &&
             (!r.isPartitioned || conf.getConf(HiveUtils.CONVERT_INSERTING_PARTITIONED_TABLE))
-            && isConvertible(r) =>
+            && isInsertConvertible(r, isPushDown) =>
         InsertIntoStatement(metastoreCatalog.convert(r), partition, cols,
           query, overwrite, ifPartitionNotExists)
 
       // Read path
       case relation: HiveTableRelation
-          if DDLUtils.isHiveTable(relation.tableMeta) && isConvertible(relation) =>
+          if DDLUtils.isHiveTable(relation.tableMeta) && isRelationConvertible(relation, isPushDown) =>
         metastoreCatalog.convert(relation)
 
       // CTAS
       case CreateTable(tableDesc, mode, Some(query))
-          if query.resolved && DDLUtils.isHiveTable(tableDesc) &&
+          if DDLUtils.isHiveTable(tableDesc) &&
             tableDesc.partitionColumnNames.isEmpty && isConvertible(tableDesc) &&
             conf.getConf(HiveUtils.CONVERT_METASTORE_CTAS) =>
         // validation is required to be done here before relation conversion.
@@ -259,7 +279,13 @@ private[hive] trait HiveStrategies {
         val partitionKeyIds = AttributeSet(relation.partitionCols)
         val normalizedFilters = DataSourceStrategy.normalizeExprs(
           filters.filter(_.deterministic), relation.output)
-
+        val condition = filters.reduceLeftOption(And)
+        val selectivity = if (condition.nonEmpty) {
+          FilterEstimation(LFilter(condition.get, relation))
+            .calculateFilterSelectivity(condition.get)
+        } else {
+          None
+        }
         val partitionKeyFilters = DataSourceStrategy.getPushedDownFilters(relation.partitionCols,
           normalizedFilters)
 
@@ -267,7 +293,7 @@ private[hive] trait HiveStrategies {
           projectList,
           filters.filter(f => f.references.isEmpty || !f.references.subsetOf(partitionKeyIds)),
           identity[Seq[Expression]],
-          HiveTableScanExec(_, relation, partitionKeyFilters.toSeq)(sparkSession)) :: Nil
+          HiveTableScanExec(_, relation, partitionKeyFilters.toSeq)(sparkSession), selectivity) :: Nil
       case _ =>
         Nil
     }

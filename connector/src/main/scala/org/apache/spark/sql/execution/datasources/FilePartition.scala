@@ -28,7 +28,7 @@ import org.apache.spark.sql.connector.read.InputPartition
  * A collection of file blocks that should be read as a single task
  * (possibly from multiple partitioned directories).
  */
-case class FilePartition(index: Int, files: Array[PartitionedFile])
+case class FilePartition(index: Int, files: Array[PartitionedFile], var sdi: String = "")
   extends Partition with InputPartition {
   override def preferredLocations(): Array[String] = {
     // Computes total number of bytes can be retrieved from each host.
@@ -88,10 +88,9 @@ object FilePartition extends Logging {
       selectedPartitions: Seq[PartitionDirectory]): Long = {
     val defaultMaxSplitBytes = sparkSession.sessionState.conf.filesMaxPartitionBytes
     val openCostInBytes = sparkSession.sessionState.conf.filesOpenCostInBytes
-    val minPartitionNum = sparkSession.sessionState.conf.filesMinPartitionNum
-      .getOrElse(sparkSession.leafNodeDefaultParallelism)
+    val defaultParallelism = sparkSession.sparkContext.defaultParallelism
     val totalBytes = selectedPartitions.flatMap(_.files.map(_.getLen + openCostInBytes)).sum
-    val bytesPerCore = totalBytes / minPartitionNum
+    val bytesPerCore = totalBytes / defaultParallelism
 
     Math.min(defaultMaxSplitBytes, Math.max(openCostInBytes, bytesPerCore))
   }

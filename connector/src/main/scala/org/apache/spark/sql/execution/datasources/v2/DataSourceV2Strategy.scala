@@ -18,12 +18,13 @@
 package org.apache.spark.sql.execution.datasources.v2
 
 import scala.collection.JavaConverters._
-
 import org.apache.spark.sql.{SparkSession, Strategy}
 import org.apache.spark.sql.catalyst.analysis.{ResolvedNamespace, ResolvedPartitionSpec, ResolvedTable}
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, DynamicPruning, Expression, NamedExpression, PredicateHelper, SubqueryExpression}
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.plans.logical.{Filter => LFilter}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.FilterEstimation
 import org.apache.spark.sql.catalyst.util.toPrettySQL
 import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, StagingTableCatalog, SupportsNamespaces, SupportsPartitionManagement, SupportsWrite, Table, TableCapability, TableCatalog}
 import org.apache.spark.sql.connector.read.LocalScan
@@ -46,9 +47,10 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
                                     project: Seq[NamedExpression],
                                     filters: Seq[Expression],
                                     scan: LeafExecNode,
-                                    needsUnsafeConversion: Boolean): SparkPlan = {
+                                    needsUnsafeConversion: Boolean,
+                                    selectivity: Option[Double]): SparkPlan = {
     val filterCondition = filters.reduceLeftOption(And)
-    val withFilter = filterCondition.map(FilterExec(_, scan)).getOrElse(scan)
+    val withFilter = filterCondition.map(FilterExec(_, scan, selectivity)).getOrElse(scan)
 
     if (withFilter.output != project || needsUnsafeConversion) {
       ProjectExec(project, withFilter)
@@ -87,7 +89,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case PhysicalOperation(project, filters,
-    DataSourceV2ScanRelation(_, V1ScanWrapper(scan, pushed, aggregate), output)) =>
+    relation @ DataSourceV2ScanRelation(_, V1ScanWrapper(scan, pushed, aggregate), output)) =>
       val v1Relation = scan.toV1TableScan[BaseRelation with TableScan](session.sqlContext)
       if (v1Relation.schema != scan.readSchema()) {
         throw QueryExecutionErrors.fallbackV1RelationReportsInconsistentSchemaError(
@@ -104,12 +106,24 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         unsafeRowRDD,
         v1Relation,
         tableIdentifier = None)
-      withProjectAndFilter(project, filters, dsScan, needsUnsafeConversion = false) :: Nil
+      val condition = filters.reduceLeftOption(And)
+      val selectivity = if (condition.nonEmpty) {
+        FilterEstimation(LFilter(condition.get, relation)).calculateFilterSelectivity(condition.get)
+      } else {
+        None
+      }
+      withProjectAndFilter(project, filters, dsScan, needsUnsafeConversion = false, selectivity) :: Nil
 
     case PhysicalOperation(project, filters,
-    DataSourceV2ScanRelation(_, scan: LocalScan, output)) =>
+    relation @ DataSourceV2ScanRelation(_, scan: LocalScan, output)) =>
       val localScanExec = LocalTableScanExec(output, scan.rows().toSeq)
-      withProjectAndFilter(project, filters, localScanExec, needsUnsafeConversion = false) :: Nil
+      val condition = filters.reduceLeftOption(And)
+      val selectivity = if (condition.nonEmpty) {
+        FilterEstimation(LFilter(condition.get, relation)).calculateFilterSelectivity(condition.get)
+      } else {
+        None
+      }
+      withProjectAndFilter(project, filters, localScanExec, needsUnsafeConversion = false, selectivity) :: Nil
 
     case PhysicalOperation(project, filters, relation: DataSourceV2ScanRelation) =>
       // projection and filters were already pushed down in the optimizer.
@@ -120,7 +134,13 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         case _ => false
       }
       val batchExec = BatchScanExec(relation.output, relation.scan, runtimeFilters)
-      withProjectAndFilter(project, postScanFilters, batchExec, !batchExec.supportsColumnar) :: Nil
+      val condition = filters.reduceLeftOption(And)
+      val selectivity = if (condition.nonEmpty) {
+        FilterEstimation(LFilter(condition.get, relation)).calculateFilterSelectivity(condition.get)
+      } else {
+        None
+      }
+      withProjectAndFilter(project, postScanFilters, batchExec, !batchExec.supportsColumnar, selectivity) :: Nil
 
     case PhysicalOperation(p, f, r: StreamingDataSourceV2Relation)
       if r.startOffset.isDefined && r.endOffset.isDefined =>
@@ -128,18 +148,28 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       val microBatchStream = r.stream.asInstanceOf[MicroBatchStream]
       val scanExec = MicroBatchScanExec(
         r.output, r.scan, microBatchStream, r.startOffset.get, r.endOffset.get)
-
+      val condition = f.reduceLeftOption(And)
+      val selectivity = if (condition.nonEmpty) {
+        FilterEstimation(LFilter(condition.get, r)).calculateFilterSelectivity(condition.get)
+      } else {
+        None
+      }
       // Add a Project here to make sure we produce unsafe rows.
-      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
+      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar, selectivity) :: Nil
 
     case PhysicalOperation(p, f, r: StreamingDataSourceV2Relation)
       if r.startOffset.isDefined && r.endOffset.isEmpty =>
 
       val continuousStream = r.stream.asInstanceOf[ContinuousStream]
       val scanExec = ContinuousScanExec(r.output, r.scan, continuousStream, r.startOffset.get)
-
+      val condition = f.reduceLeftOption(And)
+      val selectivity = if (condition.nonEmpty) {
+        FilterEstimation(LFilter(condition.get, r)).calculateFilterSelectivity(condition.get)
+      } else {
+        None
+      }
       // Add a Project here to make sure we produce unsafe rows.
-      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
+      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar, selectivity) :: Nil
 
     case WriteToDataSourceV2(relationOpt, writer, query, customMetrics) =>
       val invalidateCacheFunc: () => Unit = () => relationOpt match {

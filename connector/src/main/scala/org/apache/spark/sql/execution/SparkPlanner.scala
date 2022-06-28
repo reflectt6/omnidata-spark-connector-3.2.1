@@ -82,7 +82,8 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
       projectList: Seq[NamedExpression],
       filterPredicates: Seq[Expression],
       prunePushedDownFilters: Seq[Expression] => Seq[Expression],
-      scanBuilder: Seq[Attribute] => SparkPlan): SparkPlan = {
+      scanBuilder: Seq[Attribute] => SparkPlan,
+      selectivity: Option[Double]): SparkPlan = {
 
     val projectSet = AttributeSet(projectList.flatMap(_.references))
     val filterSet = AttributeSet(filterPredicates.flatMap(_.references))
@@ -101,10 +102,10 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
       // when the columns of this projection are enough to evaluate all filter conditions,
       // just do a scan followed by a filter, with no extra project.
       val scan = scanBuilder(projectList.asInstanceOf[Seq[Attribute]])
-      filterCondition.map(FilterExec(_, scan)).getOrElse(scan)
+      filterCondition.map(FilterExec(_, scan, selectivity)).getOrElse(scan)
     } else {
       val scan = scanBuilder((projectSet ++ filterSet).toSeq)
-      ProjectExec(projectList, filterCondition.map(FilterExec(_, scan)).getOrElse(scan))
+      ProjectExec(projectList, filterCondition.map(FilterExec(_, scan, selectivity)).getOrElse(scan))
     }
   }
 }
