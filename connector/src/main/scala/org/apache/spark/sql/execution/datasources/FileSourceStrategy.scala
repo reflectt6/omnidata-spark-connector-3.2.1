@@ -23,8 +23,7 @@ import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.expressions
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.planning.ScanOperation
-import org.apache.spark.sql.catalyst.plans.logical.{Filter => LFilter, LogicalPlan}
-import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.FilterEstimation
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
 import org.apache.spark.sql.types.{DoubleType, FloatType}
 import org.apache.spark.util.collection.BitSet
@@ -63,9 +62,9 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
   }
 
   private def getExpressionBuckets(
-                                    expr: Expression,
-                                    bucketColumnName: String,
-                                    numBuckets: Int): BitSet = {
+      expr: Expression,
+      bucketColumnName: String,
+      numBuckets: Int): BitSet = {
 
     def getBucketNumber(attr: Attribute, v: Any): Int = {
       BucketingUtils.getBucketIdFromValue(attr, numBuckets, v)
@@ -106,7 +105,7 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
           getExpressionBuckets(right, bucketColumnName, numBuckets)
       case expressions.Or(left, right) =>
         getExpressionBuckets(left, bucketColumnName, numBuckets) |
-          getExpressionBuckets(right, bucketColumnName, numBuckets)
+        getExpressionBuckets(right, bucketColumnName, numBuckets)
       case _ =>
         val matchedBuckets = new BitSet(numBuckets)
         matchedBuckets.setUntil(numBuckets)
@@ -115,8 +114,8 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
   }
 
   private def genBucketSet(
-                            normalizedFilters: Seq[Expression],
-                            bucketSpec: BucketSpec): Option[BitSet] = {
+      normalizedFilters: Seq[Expression],
+      bucketSpec: BucketSpec): Option[BitSet] = {
     if (normalizedFilters.isEmpty) {
       return None
     }
@@ -145,7 +144,7 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
 
   def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case ScanOperation(projects, filters,
-    l @ LogicalRelation(fsRelation: HadoopFsRelation, _, table, _)) =>
+      l @ LogicalRelation(fsRelation: HadoopFsRelation, _, table, _)) =>
       // Filters on this relation fall into four categories based on where we can use them to avoid
       // reading unneeded data:
       //  - partition keys only - used to prune directories to read
@@ -170,7 +169,7 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
       // subquery expressions are filtered out because they can't be used to prune buckets or pushed
       // down as data filters, yet they would be executed
       val normalizedFiltersWithoutSubqueries =
-      normalizedFilters.filterNot(SubqueryExpression.hasSubquery)
+        normalizedFilters.filterNot(SubqueryExpression.hasSubquery)
 
       val bucketSpec: Option[BucketSpec] = fsRelation.bucketSpec
       val bucketSet = if (shouldPruneBuckets(bucketSpec)) {
@@ -224,18 +223,10 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
           bucketSet,
           None,
           dataFilters,
-          table.map(_.identifier),
-          partitionColumns)
+          table.map(_.identifier))
 
       val afterScanFilter = afterScanFilters.toSeq.reduceOption(expressions.And)
-      val selectivity = if (afterScanFilter.nonEmpty) {
-        FilterEstimation(LFilter(afterScanFilter.get, l))
-          .calculateFilterSelectivity(afterScanFilter.get)
-      } else {
-        None
-      }
-      val withFilter = afterScanFilter.map(execution.FilterExec(_, scan, selectivity))
-        .getOrElse(scan)
+      val withFilter = afterScanFilter.map(execution.FilterExec(_, scan)).getOrElse(scan)
       val withProjections = if (projects == withFilter.output) {
         withFilter
       } else {

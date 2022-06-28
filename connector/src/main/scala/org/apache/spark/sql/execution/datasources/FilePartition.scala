@@ -14,7 +14,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.spark.sql.execution.datasources
 
 import scala.collection.mutable
@@ -29,7 +28,7 @@ import org.apache.spark.sql.connector.read.InputPartition
  * A collection of file blocks that should be read as a single task
  * (possibly from multiple partitioned directories).
  */
-case class FilePartition(index: Int, files: Array[PartitionedFile], var sdi: String = "")
+case class FilePartition(index: Int, files: Array[PartitionedFile])
   extends Partition with InputPartition {
   override def preferredLocations(): Array[String] = {
     // Computes total number of bytes can be retrieved from each host.
@@ -81,7 +80,7 @@ object FilePartition extends Logging {
       currentFiles += file
     }
     closePartition()
-    partitions
+    partitions.toSeq
   }
 
   def maxSplitBytes(
@@ -89,9 +88,10 @@ object FilePartition extends Logging {
       selectedPartitions: Seq[PartitionDirectory]): Long = {
     val defaultMaxSplitBytes = sparkSession.sessionState.conf.filesMaxPartitionBytes
     val openCostInBytes = sparkSession.sessionState.conf.filesOpenCostInBytes
-    val defaultParallelism = sparkSession.sparkContext.defaultParallelism
+    val minPartitionNum = sparkSession.sessionState.conf.filesMinPartitionNum
+      .getOrElse(sparkSession.leafNodeDefaultParallelism)
     val totalBytes = selectedPartitions.flatMap(_.files.map(_.getLen + openCostInBytes)).sum
-    val bytesPerCore = totalBytes / defaultParallelism
+    val bytesPerCore = totalBytes / minPartitionNum
 
     Math.min(defaultMaxSplitBytes, Math.max(openCostInBytes, bytesPerCore))
   }
