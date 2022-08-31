@@ -214,7 +214,8 @@ class FileScanRDDPushDown(
       var mapNum = 0
       if (fpuMap == null) {
         val pushDownManagerClass = new PushDownManager()
-        fpuMap = pushDownManagerClass.getZookeeperData(timeOut, parentPath, zkAddress)
+        fpuMap = pushDownManagerClass.getZookeeperData(timeOut, parentPath, zkAddress,
+          NdpConf.getNdpZookeeperJaas(sparkSession), NdpConf.getNdpZookeeperKrb5(sparkSession))
       }
       while (datanode.hasNext && mapNum < maxFailedTimes) {
         val datanodeStr = datanode.next()._1

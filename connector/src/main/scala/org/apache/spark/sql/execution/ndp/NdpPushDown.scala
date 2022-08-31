@@ -102,7 +102,8 @@ case class NdpPushDown(sparkSession: SparkSession)
 
   def shouldPushDown(): Boolean = {
     val pushDownManagerClass = new PushDownManager()
-    fpuHosts = pushDownManagerClass.getZookeeperData(timeOut, parentPath, zkAddress)
+    fpuHosts = pushDownManagerClass.getZookeeperData(timeOut, parentPath, zkAddress,
+      NdpConf.getNdpZookeeperJaas(sparkSession), NdpConf.getNdpZookeeperKrb5(sparkSession))
     fpuHosts.nonEmpty
   }
 
@@ -334,6 +335,16 @@ object NdpConf {
   val NDP_GRPC_TRUST_CA_FILE_PATH = "spark.sql.ndp.grpc.trust.ca.file.path"
   val NDP_PKI_DIR = "spark.sql.ndp.pki.dir"
   val NDP_MAX_FAILED_TIMES = "spark.sql.ndp.max.failed.times"
+  val NDP_ZOOKEEPER_JAAS = "spark.sql.zookeeper.jaas.conf"
+  val NDP_ZOOKEEPER_KRB5 = "spark.sql.zookeeper.krb5.conf"
+
+  def getNdpZookeeperJaas(sparkSession: SparkSession): String = {
+    sparkSession.conf.getOption(NDP_ZOOKEEPER_JAAS).getOrElse("/opt/hive/jaas.conf")
+  }
+
+  def getNdpZookeeperKrb5(sparkSession: SparkSession): String = {
+    sparkSession.conf.getOption(NDP_ZOOKEEPER_KRB5).getOrElse("/opt/hive/krb5.conf")
+  }
 
   def toBoolean(key: String, value: String, sparkSession: SparkSession): Boolean = {
     try {

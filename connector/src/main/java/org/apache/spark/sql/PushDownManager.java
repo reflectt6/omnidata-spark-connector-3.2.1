@@ -48,8 +48,11 @@ public class PushDownManager {
     private static final int ZOOKEEPER_RETRY_INTERVAL_MS = 1000;
 
     public scala.collection.Map<String, String> getZookeeperData(
-        int timeOut, String parentPath, String zkAddress) throws Exception {
+        int timeOut, String parentPath, String zkAddress, String jaasConf, String krb5Conf) throws Exception {
         Map<String, String> fpuMap = new HashMap<>();
+        System.setProperty("java.security.auth.login.config", jaasConf);
+        System.setProperty("java.security.krb5.conf", krb5Conf);
+        System.setProperty("zookeeper.sasl.client", "true");
         CuratorFramework zkClient = CuratorFrameworkFactory.builder()
                 .connectString(zkAddress)
                 .sessionTimeoutMs(timeOut)
